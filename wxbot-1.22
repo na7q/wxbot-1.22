@@ -1,0 +1,1406 @@
+#! /usr/bin/perl
+# WxBot -- an APRS westher forecast auto-responder
+# Copyright (c) 2016, Martin Nile
+#
+#Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+#
+#The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+#
+#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+# connects to the aprs-is and listens for messages and responds with a weather forecast
+#
+# The forecast data is sourced from "forecast.weather.gov" which covers the United States.  
+# The lat/lon for the originating station is sourced from api.aprs.fi
+#
+# the forecast request is in the form:
+#   Where when what
+# "Where" can be a callsign, zipcode, 4 or 6 character Maidenhead grid,ICAO station or lat/lon. Default is the originating callsign.
+# "when" current,today,tonight,tomorrow, or day of the week up to 5 days from today.  Default is "today". 
+#    abbreviations for weekdays are valid i.e. wed instead of Wednesday, tue and tues for Tuesday
+# "what" can be "brief","current","metar","whois" or "full".  The default is "brief".
+#
+# The default forecast is "brief" and is intended to fit within a single APRS message.
+# If there are weather hazards in effect for the given location, they may cause the "brief" forecast to
+# expand to more than one message.
+# The "full" forecast will be split across multiple messages.
+# The program will attempt to recognize a mix of "where what when" 
+#
+# example forecast request messages:
+#  (empty message)		Return today's brief forecast for the origniating station's current location
+#  KI6WJP tomorrow full		Return the full forecast for tomorrow for the most recent location of KI6WJP.
+#  W1AW current			Return the current conditions at the nearest NWS station to W1AW
+#  full				Return today's full forecast for the origniating stations current location
+#  Tomorrow			Return brief forecast for tomorrow.
+#  Tonight			Return brief forecast for tonight.
+#  tomorrow night		Return brief forecast for tomorrow night.
+#  Thursday			Return brief forecast for Thursday
+#  Friday night			Return brief forecast for Friday night.
+#  96067			Return brief forecast for zipcode 96067
+#  CN81				Return brief forecast for the center of Maidenhead grid CN81
+#  CN81uh			Return brief forecast for the center of Maidenhead grid CN81uh
+#  41.12/-122.2			Return brief forecast for point 41.12N/122.1W 
+#                                any two numbers separated with a slash is assumed to be Latitude and Longitude
+#  metar			Return aviation METAR report from nearest Metar station
+#  KSFO				Return metar report from San Francisco International
+#  CWOP				Return CWOP weather report from nearest CWOP station
+#  Los Angeles,CA tomorrow full	Return a full forecast for somewhere in LA 
+#
+# An error is returned if the requested location does not have a forecast available from forecast.weather.gov.
+#
+# If the sender includes a message ID, then an ack is generated.
+# If the message id indicates that the sender is "reply-ack" capable, then the ack is appended to the end of the reply.
+# Message IDs are only sent if the original station sends message ids
+# However, the program does not implement the retry/backoff algorithm for retransmission of
+# un-acknowleged messages.  It relies on the origination station to retransmit
+# the original message that prompted the reply.
+#
+# Of course all of this assumes that a two-way igate is providing the connection between the RF and the IS.
+# version 1.2 20160119, add weather hazard
+# version 1.3 20160222 be more picky with data returned from national weather service, it may not be json
+# version 1.4 20160224 add 3 second delay between sending packets to the same station.
+# version 1.5 20160225 recognize "current" and "now" for current conditions at nearest NWS station
+# version 1.6 20160225 recognize misspelled words.
+# version 1.7 20160126 use call.n0agi.com to look up call signs that don't appear in api.aprs.fi, catch aprs-is errors
+# 			add ICAO stations and metar lookups
+#			add info, whois, who-is to return FCC ULS data
+# version 1.8 20160128 recognize additional mis-spellings
+#                       error checking on METAR results, only load METAR reporting ICAO stations
+#			recognize wxbot as an alias
+# version 1.9 20160129	add WXBOT alias, and periodic position beacon
+#			fix bug returning previous forecast if current forecast is unavailable
+# version 1.10 20160201	change position report packet to indicate "message capable"
+#			put the status after the position report
+#			change status1
+# version 1.11 20160202 fix beacon1
+# version 1.12 20160202 add CWOP station list, and CWOP to "what"
+# version 1.13 20160204 recognize IATA (3 letter) airport codes in addition to ICAR codes
+#			use findu.com wxnear.cgi to  identify nearext CWOP station
+#			change symbol from WX to computer. Otherwise findu and aprs.fi expect a weather report
+#			Recognize Amateur CWOP station id's (i.e. AXnnn)
+# version 1.14 20160205 fix glitch in nearest CWOP where the distance is 0, there is no direction 
+# version 1.15 20160315 add help message in response to "help" or "?"
+# version 1.16 20160701 bump number of forecast messages
+# version 1.17 20160711 reply with a numbered message if the requesting station originated a numbered message
+# version 1.18 20160802 keep served count in file.  Updated when we send bulletins
+# version 1.19 20160802 recognize city,st as location.  use us.txt from geonames.org for zipcodes
+# version 1.20 20161010 delay 5 seconds between packets.
+# version 1.21 20161115 close and re-open the APRS-IS feed once per day (Thanks WA1GOV)
+# version 1.22 20161130 recognize OUTNET as an option, and add OUTNET and APOUT to path.
+#-------------------------------------------------------------------
+#-------------------------------------------------------------------
+#
+# user configuration -- change these for your callsign etc
+#
+#-------------------------------------------------------------------
+#-------------------------------------------------------------------
+my $version="1.24";
+my $callsign="NA7Q-WX";
+my $callpass='2802';
+my $apikey="96986.RBeJG9W4JTXBuZ4";	# api.aprs.fi key... get yours under "account" at aprs.fi
+my $alias='WX';			# change this if you want to respond to messages addressed to something other than $callsign
+my $filter='m/150';				# filter applied to the aprs-is connection
+my $server="theconnectdesk.com";		# aprs-is server
+my $port=14580;				# aprs-is server port
+my $aprstocall="APRS";			# aprs tocall see http://www.aprs.org/tocalls.txt
+my $outcall="APOUT,OUTNET";		# aprs tocall and path for OUTNET packets
+my $tocall;
+my $servedfilename = 'wxbotserved.txt';	# where we keep track of how many forecasts have been served
+my $zipcodefile = 'us.txt';		# US zipcodes, city, state, lat/lon from http://download.geonames.org/export/zip/US.zip
+
+# stuff needed for the periodic position beacon -- change to suit
+my $mylat="4610.24N";	# my latitude ddmm.mmN
+my $mytable="/";	# my symbol table (/=primary \=secondary, or overlay)
+my $mylon="12334.23W";	# my longitude dddmm.mmW
+my $mysymbol="?";	# my symbol (don't use _ symbol, the comment is treated as a corrupt weather report)
+
+#-------------------------------------------------------------------
+#-------------------------------------------------------------------
+#
+# Global Variables
+#
+#-------------------------------------------------------------------
+#-------------------------------------------------------------------
+my $bulletin0="WxBot $version US weather forecast via APRS message.";
+my $bulletin1="Send a message to WxBot for a weather forecast at your location.";
+my $bulletin2="see https://sites.google.com/site/ki6wjp/wxbot";
+my $beacon1="\=$mylat$mytable$mylon$mysymbol\WxBot $version";
+my $status1="\>Send an APRS message to WX for a weather forecast at your location. (US Only)";
+#                   1         2         3         4         5         6
+#          1234567890123456789012345678901234567890123456789012345678901234567
+my @help=("Send an APRS message to $alias with 'where' 'when' 'what'",
+          "where= City,ST callsign,APRS obj,lat/lon,grid,CWOP,airport or zip",
+          "when= tonight,tomorrow, or day of week i.e. Sunday",
+          "what= full,metar,cwop,current or whois",
+          "Forecast available only at United States locations");
+my @fullhelp=("default 'where' is location of sending callsign",
+          "examples:  tonight -- return brief forecast for tonight",
+          "CN81 Friday    -- returns Friday forecast for center of grid CN81",
+          "W1AW Thursday night full  -- Thurs night full forecast at W1AW",
+          "90210  -- current forecast in Beverly Hills",
+          "Boston,MA  -- current forecast in Boston",
+          "KSFO -- return METAR report for San Francisco International",
+          "metar -- return METAR report for nearest ICAO station",
+          "whois w1aw -- return FCC ULS data for w1aw",
+          "40.77/-39.96 -- current forecast in New York City");
+
+my $sentid="AA";	# we only send message IDs with reply-ack.  
+my $replyack="";	# if the sender is reply ack capable, this gets appended to the outbound message
+
+# variables specific to the currrent forcast request
+my $where;
+my $when;
+my $what;
+my $lat;
+my $lon;
+my $forecast;		# json structure returned from forcast.weather.gov
+my $aprs;		# parsed aprs packet
+my $briefforecast;
+my $fullforecast;
+my $current;		# current conditions
+my $messagedest;
+my $metar;		# metar report for ICAO station
+my $icaostation;	# ICAO station ID
+my $apicall;		# callsign that was used to get the current lat/lon api.aprs.fi
+my $callinfo;		# FCC ULS information for given callsign
+
+# cwop variables
+my $cwopstation;	# CWOP station ID
+my $cwop;		# formatted cwop report
+my $cwoptime;		# timestamp of most recent cwop report (0 means no report)
+my $cwoptemp;		# temperature in degC
+my $cwophumidity;
+my $cwopwinddir;
+my $cwopwindspeed;
+my $cwopwindgust;
+my $cwoprain1h;
+my $cwoprain24h;
+my $cwoprain_mn;
+
+# variables that keep track of previously sent packets
+my $prevcall;		# callsign of the previous packet	(used to insert delays between packets sent to the same callsign)
+my $prevpacket;		# what time the previous packet was sent
+my $prevbulletin;	# when was the last bulletin sent out (we send these out every 4 hours)
+my $prevstatus;		# when was the last status packet sent out (sent every 30 minutes);
+my $packetdelay=5;	# 5 seconds between packets
+my $aprsistime;		# how long has the aprs-is connection been active
+
+# hash that holds the lat/lon for a given zipcode or city
+my %ziplat;
+my %ziplon;
+my %citylat;
+my %citylon;
+
+
+# hash that holds lat/lon for the ICAO Metar stations
+my %icaolat;
+my %icaolon;
+my %icaoiata;		# 3 letter iata code for ICAO stations (SFO -> KSFO)
+
+# hash that holds lat/lon for CWOP stations
+my %cwoplat;
+my %cwoplon;
+my %cwopcall;		# amateur radio CWOP stations are stored under their callsign, not the station ID
+
+#-------------------------------------------------------------------
+# Perl Libraries
+#-------------------------------------------------------------------
+use Ham::APRS::IS;
+use Ham::APRS::FAP qw(parseaprs);
+use Data::Dumper;		# only for debugging json results
+use JSON;
+use LWP::UserAgent;		# web agent that we use to talk to api.aprs.fi and weather service
+
+#-------------------------------------------------------------------
+#-------------------------------------------------------------------
+#
+# Mainline program starts here
+#
+#-------------------------------------------------------------------
+#-------------------------------------------------------------------
+my $ua = LWP::UserAgent->new;
+$ua->agent("KI6WJP WxBot/$version (https://sites.google.com/site/ki6wjp/wxbot)");
+
+# load the number of served forecasts
+&loadserved();
+# load the zipcode latitude/longitude
+&loadzips();
+# load the ICAO metar station latitude/longitude
+&loadicao();
+# load the CWOP station lat/lon
+# not used as of version 1.13 -- we ask findu instead
+#&loadcwop();
+
+print STDERR "opening aprs-is connection\n";
+my $is = new Ham::APRS::IS("$server:$port", $callsign, 'appid' => "WxBot $version", 'passcode' => $callpass, 'filter' => $filter);
+$is->connect('retryuntil' => 3) || die "Failed to connect: $is->{error}";
+$aprsistime=time;
+
+# clear any status
+undef $is->{error};
+  
+# send the initial position beacon
+sendbeacon($alias,$beacon1);
+$prevstatus=time;
+
+while(1) {
+	# go get a packet from the APRS-IS timeout after 30 seconds
+	my $aprsraw = $is->getline(30);
+
+	# if the aprs-is has been active for more than 24 hours, close and re-open
+	if(time-(24*3600) > $aprsistime) {
+		print STDERR "Re-Opening APRS-IS connection\n";
+		# disconnect and try to re-connect to the IS
+		$is->disconnect();
+		# keep trying until we are connected
+		while(! $is->connected) {
+			$is->connect('retryuntil' => 3) || print STDERR "Failed to connect: $is->{error}\n";
+			sleep 30;
+		}
+		print STDERR "APRS-IS re-connected\n";
+		$aprsistime=time;
+	}
+		
+
+	# if we get an error, see what it is and try to recover
+	if(defined $is->{error}) {
+		# if we don't hear anything within 30 seconds, we get a timeout
+		# that usually means we have lost the connection to the aprs-is
+		if($is->{error} =~ "timeout") {
+			print STDERR "APRS-IS timeout trying to reconnect\n";
+			# disconnect and try to re-connect to the IS
+			$is->disconnect();
+			# keep trying until we are connected
+			while(! $is->connected) {
+				$is->connect('retryuntil' => 3) || print STDERR "Failed to connect: $is->{error}\n";
+				sleep 30;
+			}
+			print STDERR "APRS-IS re-connected\n";
+		}
+		else {
+			print STDERR "got an error $is->{error}\n";
+			print STDERR "raw=[$aprsraw]\n";
+		}
+		undef $is->{error};
+		next;
+	}
+	if (!defined $aprsraw) {
+		print STDERR "got nothing from getline\n";
+		next
+	}
+	# skip comments
+	if($aprsraw =~ /^#/) {
+		# every 4 hours send a bulletin announcing our presence
+		if(time - $prevbulletin > 4*3600) {
+#			sendto("BLN0",$bulletin0);
+#			sendto("BLN1",$bulletin1);
+#			sendto("BLN2",$bulletin2);
+#			$prevbulletin = time;
+		}
+		# every 30 minutes send position and status
+		if(time - $prevstatus > 1800) {
+			sendbeacon($alias,"$beacon1 $forecastcount served");	# send the position beacon
+#Comment below for no status update
+			sendbeacon($alias,$status1);
+			$prevstatus=time;
+			&updateserved;	# save the forecastcount variable so we can read it next time we start
+		}
+		next;
+	}
+
+	# if we get here, then we have received an APRS packet
+	$timestamp=localtime();
+	print STDERR "$timestamp $aprsraw\n";
+	#print "$timestamp $aprsraw\n";
+
+	# if the data can be parsed, then see if it is a message for us
+	if(parseaprs($aprsraw, \%aprs)) {
+		#while (my ($key, $value) = each(%aprs)) {
+                #      print STDERR "$key: $value\n";
+		#}
+
+		# is this a message for me or my alias? and not empty
+		$destination=$aprs{"destination"};
+		if($destination =~ /$callsign|$alias/ && $aprs{"type"} eq "message" && $aprs{'message'} ne "") {
+			# if an ack is requested, then send the ack, or generate the reply ack that gets appended to the outbound reply
+			&generateack();	
+
+			&parsemessage();	# read message data looking for where,when,what
+
+			if($what eq "HELP") {
+				sendhelp();
+			}
+
+			# if we received "where" that ended up with latitude and longitude, then go get the forecast for that point
+			elsif($lat && $lon) {
+				if($what eq "METAR") {
+					&sendreply($metar);
+				}
+				elsif($what eq "CWOP") {
+					&sendreply($cwop);
+				}
+				elsif($what eq "info") {
+					unless($callinfo) {	# if we didn't get the callsign info earlier, go get it
+						&lookupcall($apicall);
+					}
+					&sendreply($callinfo);
+				}
+				elsif($what eq "full") {
+					&getforecast();
+					&sendreply($fullforecast);
+				}
+				elsif($what eq "current") {
+					&getforecast();
+					&sendreply($current);
+				}
+				else {
+					&getforecast();
+					&sendreply($briefforecast);
+				}
+				$forecastcount++;	# bump the number of forecast requests served
+			}
+			else {
+				&sendreply("Unable to find location for $aprs{'srccallsign'}");
+			}
+			$cwop=$cwopstation=$what=$when=$where=$lat=$lon=$messageid=$replyack=$callinfo=$apicall="";
+			undef %aprs;
+		}
+	}
+}
+$is->disconnect() || die "Failed to disconnect: $is->{error}";
+
+#-------------------------------------------------------------------
+# sendhelp -- send the help message to the requesting station
+#-------------------------------------------------------------------
+sub sendhelp() {
+	foreach $msg (@help) {
+		&sendreply($msg);
+	}
+}
+
+#-------------------------------------------------------------------
+# getforecast -- given $lat,$lon, get the forecast from forcast.weather.gov
+#-------------------------------------------------------------------
+sub getforecast() {
+	my $fcsturl="http://forecast.weather.gov/MapClick.php?lat=$lat&lon=$lon&FcstType=json";
+	my $req = HTTP::Request->new(GET => $fcsturl);
+	my $period;
+	my $county;
+	$fullforecast=$briefforecast="Error, unable to get a forecast for location $lat/$lon";
+
+        $req->content_type('application/x-www-form-urlencoded');
+        $req->content('query=libwww-perl&mode=dist');
+
+        # Pass request to the user agent and get a response back
+	print STDERR "getting forecast\n";
+        my $res = $ua->request($req);
+	if ($res->is_success) {
+		# if the result doesn't start with left curly brace then whine
+		# this occurs for NWS stations that dont support JSON (i.e PagoPago)
+		if(substr($res->content,0,1) ne "{") {
+			#print $res->content;
+			print STDERR "forecast result doesn't look like json\n";
+			return(0);
+		}
+
+		$forecast=decode_json($res->content);
+		# if we don't get a valid json result, then report an error
+		if(!exists $forecast->{"operationalMode"}) {
+			print STDERR "Error, unable to get a forecast for location $lat/$lon\n";
+			$location=$periodname="";
+			return(0);
+		}
+		print STDERR "got a valid forecast\n";
+
+		# If the county is "marine" then the json data is different it only has 7 periods and has abbreviated day names
+		$county = $forecast->{location}{county};
+		if($county eq "marine") {
+			$what=substr($what,0,3);	# marine forecasts only have 1st three letters of day.
+# fix this!! it won't match Today, Tonight, or Wed night etc...
+		}
+		# go through the period names looking for one that matches the requested period
+		$period=0;
+		if($when ne "") {
+			#
+			# NOTE!! we really should figure out exactly what forecast they are asking for
+			# and select that period instead of trying to match the name that the NWS assigns.
+			# for instance, the NWS names holidays i.e. Christmas, New Years etc...
+			#
+			# look through all of the periods looking for one that matches what has been requested.
+			# note: marine forecasts use abbreviated day names (i.e Tue instead of Tuesday)
+			for($period=0;$period <=12;$period++) {
+				#print STDERR "comparing [($forecast->{time}{startPeriodName}[$period]] to [$when]\n";
+				if(lc $forecast->{time}{startPeriodName}[$period] eq lc $when) {
+					#print STDERR "found forecast period at $period\n";
+					last;
+				}
+			}
+			if($period > 12) {
+				$period=0;
+			}
+			# if they asked for tomorrows forecast, it is either period 1 or 2 depending on 
+			# how late we are in the day (after 6:00pm the first period "Tonight
+			if(lc $when eq "tomorrow") {
+				if($forecast->{time}{startPeriodName}[0] eq "Tonight") {
+					$period=1;
+				}
+				else {
+					$period=2;
+				}
+			}
+		}
+		#print STDERR "using period $period\n";
+
+
+		$templabel = $forecast->{time}{tempLabel}[$period];
+		$temp=$forecast->{data}{temperature}[$period];
+
+		$location = $forecast->{location}{areaDescription};
+		$periodname = $forecast->{time}{startPeriodName}[$period];
+		$briefweather = $forecast->{data}{weather}[$period];
+		$fullweather = $forecast->{data}{text}[$period];
+		$pop = $forecast->{data}{pop}[$period];
+		if($pop ne "") {
+			$pop=" $pop\%";
+		}
+		$hazard = $forecast->{data}{hazard}[0];
+		if($hazard) {
+			$hazard = " $hazard,";
+		}
+
+		$briefforecast ="$location.$hazard $periodname,$briefweather$pop $templabel $temp\F\n";
+		$fullforecast ="$location.$hazard $periodname,$fullweather\n";
+		my $currentname = $forecast->{currentobservation}{name};
+		my $currenttemp = $forecast->{currentobservation}{Temp};
+		my $currentdewp = $forecast->{currentobservation}{Dewp};
+		my $currentrelh = $forecast->{currentobservation}{Relh};
+		my $currentwinds = $forecast->{currentobservation}{Winds};
+		my $currentwindd = $forecast->{currentobservation}{Windd};
+		my $currentweather = $forecast->{currentobservation}{Weather};
+
+		$current="Currently at $currentname, Temp:$currenttemp\F Wind:$currentwindd\@$currentwinds,$currentweather";
+		#print STDERR "current weather [$current]\n";
+
+		# marine forecasts are a different format, we only have the full forecast available
+		#print STDERR "forecast county = [$county]\n";
+		if($county eq "marine") {
+			$briefforecast=$fullforecast;
+		}
+		print STDERR "$location. $periodname,$briefweather $pop $templabel $temp\F\n";
+		#print STDERR "$location. $periodname,$fullweather\n";
+		return(1);
+	}
+	else {
+		print STDERR "unable to get forecast for $lat/$lon\n";
+		return(0);
+	}
+}
+
+#-------------------------------------------------------------------
+# sendreply -- send a reply to the station 
+#-------------------------------------------------------------------
+sub sendreply() {
+	print STDERR "sending reply to $messagedest\n";
+	my $fullmsg = $_[0];
+	my $ack="";
+	# if the message looks like an error, then force the tocall to be the generic APRS tocall so the errors dont go out on the OUTNET
+	if($fullmsg =~ /error|unable/i) {
+		$tocall=$aprstocall;
+	}
+
+	# split the outbound message into 67 byte chunks.
+	foreach $msg (unpack("(A67)*",$fullmsg)) {
+		if(length($msg) < 1) {
+			next;
+		}
+		# if the originating station is reply-ack capable, then the ack is added to the end of our outbound message.
+		# otherwise, we do not send message IDs,  If the original sender does not get the packet, he should ask again.
+		if($messageid =~ /\}/) {
+			# extract the ACK from the messageid (everything up to, but not including the '}')
+			($ack)=$messageid =~ /(\w+)\}/;
+			$replyack="{$sentid\}$ack";	# tack the ack onto our outgoing message ID
+			#print STDERR "replyack=[$replyack]\n";
+			$sentid++;
+			if($sentid eq 'ZZ') {
+				$sentid='AA';
+			}
+		}
+		# if the orignating station sent a numbered message, reply with a numbered message
+		elsif($messageid ne "") {
+			$replyack="{$sentid";
+			$sentid++;
+			if($sentid eq 'ZZ') {
+				$sentid='AA';
+			}
+		}
+		else {
+			$replyack='';
+		}
+		# build up an APRS message and send it to the aprs-is.  
+		my $packet="$destination>$tocall\:\:$messagedest\:$msg$replyack";
+
+		# delay between packets sent to the same station so we don't flood the RF
+		if($prevdest eq $messagedest && time - $prevpacket < $padetdelay) {
+			sleep($packetdelay);
+		}
+		print STDERR "sending [$packet]\n";
+		#print "sending [$packet]\n";
+		$is->sendline($packet);
+
+		# keep track of where and when we sent the last packet
+		$prevdest=$messagedest;
+		$prevpacket=time;
+	}
+}
+
+#-------------------------------------------------------------------
+# sendto -- send a message to a specific destination (used for sending bulletins)
+#   assumes the message is less than 67 characters
+#   does not send message ID, or reply Acks
+#   sends from $alias instead of $callsign
+#   sendto(recipient,message);
+#-------------------------------------------------------------------
+sub sendto() {
+	my $recip=$_[0];
+	my $recip=sprintf("%-9s",$_[0]);
+	my $fullmsg=$_[1];
+	my $msg;
+
+	# build up an APRS message and send it to the aprs-is.  
+	my $packet="$alias>$aprstocall\:\:$recip\:$fullmsg";
+	print STDERR "sending [$packet]\n";
+	#print "sending [$packet]\n";
+	$is->sendline($packet);
+	$prevdest=$recip;
+	$prevpacket=time;
+}
+
+#-------------------------------------------------------------------
+# sendbeacon -- given from,beacon send a generic aprs packet
+# 		include packet type in the beacon
+#		Position packets begin with !
+#		Status packets begin with >
+#-------------------------------------------------------------------
+sub sendbeacon() {
+	my $from=shift;
+	my $beacon=shift;
+
+	my $packet="$from>$aprstocall\:$beacon";
+	print STDERR "sending beacon $packet\n";
+	$is->sendline($packet);
+}
+
+#-------------------------------------------------------------------
+# generateack -- if the sender requests it, generate an ack message
+#-------------------------------------------------------------------
+sub generateack() {
+	$messagedest=sprintf("%-9s",$aprs{"srccallsign"});
+	$messageid=$aprs{"messageid"};
+
+	# look for OUTNET in message, change tocall and path so the replies show up on OUTNET
+	if($aprs{"message"} =~ /OUTNET|outernet/i) {
+		$tocall=$outcall;
+	}
+	else {
+		$tocall=$aprstocall;	# otherwise, use generic APRS tocall
+	}
+	# if the sender has included as messageid, then we need to send an ack.
+	# 
+	if($messageid) {
+		# if the sender supports reply acks, then the ack gets appended to the outbound message
+		if($messageid =~ /\}/) {
+			# nothing to do here, the reply ack is generated later;
+		}
+		else {
+			$replyack="";
+			# note: use generic aprs tocall so acks dont go out to the OUTNET
+			my $packet=qq[$destination>$aprstocall\:\:$messagedest\:ack$messageid];
+			#print STDERR "ack = [$packet]\n";
+			$is->sendline($packet);
+			$prevdest=$messagedest;	# keep track of where and when we sent a packet to avoid flooding the RF
+			$prevpacket=time;
+		}
+	}
+}
+
+#-------------------------------------------------------------------
+# parsemessage -- figure out what the message is telling us
+#        look for "where", "when", "what"
+#-------------------------------------------------------------------
+sub parsemessage() {
+	$lat=$lon=0;
+	$when="";
+	$what="";
+	$city="";
+	$icaostation="";
+	$metar="";
+
+	# does the message have what looks like city,ST
+	if($aprs{"message"} =~ /(.+?)\, *(AK|AL|AR|AZ|CA|CO|CT|DC|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|PR|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY)/i) { 
+		$fullcity=uc($1);
+		$state=uc($2);
+		$city=$fullcity;
+		$city=~s/ //g;	# strip out spaces
+
+		# if it is a city we recognize, use lat/lon
+		#print "found city[$city,$state]\n";
+		if($citylat{"$city,$state"}) {
+			print STDERR "found city[$city,$state]\n";
+			$lat=$citylat{"$city,$state"};
+			$lon=$citylon{"$city,$state"};
+			#print "$city,$state $lat/$lon\n";
+			# delete the city,state from the message and parse the rest of the message
+			$aprs{"message"}=~s/$fullcity\, *$state//i;
+			#print "message after stripping city,st=[$aprs{'message'}]\n";
+		}
+	}
+		
+
+	foreach $word (split(/ /,$aprs{"message"})) {
+		#print STDERR "message word=[$word]\n";
+		# see if $word is a 5 digit zipcode
+		if($word =~ /^\d{5}$/) {
+			$lat=$ziplat{$word};
+			$lon=$ziplon{$word};
+			print STDERR "found a zip code [$word].using $lat/$lon\n";
+		}
+		elsif($word =~ /^help$|^\?$/i) {
+			$what="HELP";
+		}
+		elsif($word =~ /metar/i) {
+			$what="METAR";
+		}
+		elsif($word =~ /cwop/i) {
+			$what="CWOP";
+		}
+                elsif($word =~/^tod$|^today/i) {
+			# if the previous word was a CWOP station, and we are asking for a forecast, then forget about the CWOP report
+			if($what eq "CWOP") {$what="brief";}
+                        $when="today";
+                }
+                elsif($word =~/^tonight$|^tonite$/i) {
+			if($what eq "CWOP") {$what="brief";}
+                        $when="tonight";
+                }
+                elsif($word =~ /^mon$|monday/i) {
+			if($what eq "CWOP") {$what="brief";}
+                        $when="monday";
+                }
+                elsif($word =~ /^tue$|^tues$|^tuesday$/i) {
+			if($what eq "CWOP") {$what="brief";}
+                        $when="tuesday";
+                }
+                elsif($word =~ /^wed$|^weds$|^wednesday$/i) {
+			if($what eq "CWOP") {$what="brief";}
+                        $when="wednesday";
+                }
+                elsif($word =~ /^thu$|^thurs$|^thursday$/i) {
+			if($what eq "CWOP") {$what="brief";}
+                        $when="thursday";
+                }
+                elsif($word =~ /^fri$|^friday$/i) {
+			if($what eq "CWOP") {$what="brief";}
+                        $when="friday";
+                }
+                elsif($word =~ /^sat$|^saturday$/i) {
+			if($what eq "CWOP") {$what="brief";}
+                        $when="saturday";
+                }
+                elsif($word =~ /^sun$|^sunday$/i) {
+			if($what eq "CWOP") {$what="brief";}
+                        $when="sunday";
+                }
+		elsif($word =~ /night|tomorrow|tommorrow|^tom$|tommorow/i) {	# common misspellings
+			if($what eq "CWOP") {$what="brief";}
+			print STDERR "found when $word\n";
+			if($when) {
+				$when = "$when $word";
+			}
+			else {
+				$when=$word;
+			}
+		}
+		elsif($word =~ /info|whois|who-is/i) {
+			$what="info";
+		}
+		elsif($word =~ /current|now/i) {
+			$what="current";
+		}
+		elsif($word =~ /full|brief/i) {
+			print STDERR "found what $word\n";
+			$what=lc($word);
+		}
+		elsif(exists $icaoiata{uc $word}) {	# 3 letter ICAR airport code (i.e SFO)
+			print STDERR "$word is valid ICAR station\n";
+			$icaostation=$icaoiata{uc($word)};	# get the 4 letter ICAO code for the ICAR station
+			print STDERR "using $icaostation\n";
+			$lat=$icaolat{$icaostation};
+			$lon=$icaolon{$icaostation};
+			&getmetar($icaostation);
+			$what="METAR";		# if they give an ICAO station, assume they want a METAR.
+		}
+		elsif(exists $icaolat{uc $word}) {	# ICAO airport code (i.e. KSFO)
+			print STDERR "$word is valid ICAO station\n";
+			$icaostation=uc($word);
+			$lat=$icaolat{$icaostation};
+			$lon=$icaolon{$icaostation};
+			&getmetar($icaostation);
+			$what="METAR";		# if they give an ICAO station, assume they want a METAR.
+		}
+		# If the word looks like a CWOP station (ie EW5697), see if we can get a weather report from findu
+		# note: amateur cwop stations use regular ham callsigns.  To get that you use the actual callsign-ssid
+		elsif($word =~ /^[A-Za-z]{2}\d{4}$/) {
+			if(getCwopFindu(uc $word)) {
+				$what='CWOP';	# for now assume they want a CWOP report.  they can override if they wish
+			}
+			# get the lat/lon for $word even if it isn't a CWOP station
+			getapiloc($word);
+		}
+		# maidenhead grid 4 or 6 characters starting with 2 letters and 2 digts and optionally 2 letters
+		elsif($word =~ /^[a-zA-Z]{2}\d{2}[a-zA-Z]{2}$|[a-zA-Z]{2}\d{2}$/) {
+			print STDERR "found maidenhead grid\n";
+			($lat,$lon)=&maidenheadtolatlon($word);
+			print STDERR "maidenhead returned $lat/$lon\n";
+		}
+		# two numbers separated by a slash are lat/lon i.e 41.123/-122.3
+		elsif($word =~ /^([\d\.\-]+)\/([\d\.\-]+)/) {
+			print STDERR "found a lat/lon word $1/$2\n";
+			$lat=$1;
+			$lon=$2;
+		}
+		# if we didn't find anything we understood, ask aprs.fi if there is an aprs item  
+		elsif(length($word) >= 3) {
+			print STDERR "didn't understand $word, looking for lat/lon on aprs.fi\n";
+			&getapiloc($word);
+			$apicall=$word;	# remember that this was the callsign used
+			# aprs.fi didn't find anything, then call n0agi for for callsign lookup
+			if(lat == 0 && $lon == 0) {
+				&lookupcall($word);
+			}
+		}
+	}
+
+	# if we didn't get a location, then use the location of the source callsign
+	if($lat == 0 && $lon== 0 && $what ne "HELP") {
+		print STDERR "using srccallsign location\n";
+		&getapiloc($aprs{'srccallsign'});
+		$apicall=$aprs{'srccallsign'};
+	}
+
+	# if they asked for a metar and they didn't give us an ICAO station, then find nearest and get metar
+	if($what eq "METAR" && $icaostation eq "") {
+		$icaostation=&getNearestIcao();
+		&getmetar($icaostation);
+	}
+
+	if($what eq "CWOP" && $cwopstation eq "") {
+		$cwopstation=getNearestCwopFindu();	# also returns formatted $cwop message
+		#&getcwop($cwopstation);
+	}
+
+	print STDERR "where = [$lon/$lat],when=[$when],what=[$what]\n";
+}
+
+#-------------------------------------------------------------------
+# getapiloc use api.aprs.fi to get the lat/lon for a callsign
+#-------------------------------------------------------------------
+sub getapiloc() {
+	my $call=$_[0];
+
+	print STDERR "looking for api location for $call\n";
+	# Create a request
+	my $req = HTTP::Request->new(GET => "http://api.aprs.fi/api/get?name=$call&what=loc&apikey=$apikey&format=json");
+	$req->content_type('application/x-www-form-urlencoded');
+	$req->content('query=libwww-perl&mode=dist');
+
+	# Pass request to the user agent and get a response back
+	my $res = $ua->request($req);
+
+	# Check the outcome of the response
+	if ($res->is_success) {
+		# decode the json data
+		my $json=decode_json($res->content);
+
+		#print STDERR Dumper $json;
+
+
+		# note: it is possible for there to be more than one match on aprs.fi.  This is usually
+		# where one "callsign" is actually a ship using AIS instead of APRS.
+
+		if($json->{found} >= 1) {
+			$lat=$json->{entries}[0]{lat};
+			$lon=$json->{entries}[0]{lng};
+		}
+		else {
+			print STDERR "didn't find a match for $call on api.aprs.fi\n";
+			$lat=$lon=0;
+		}
+		#print STDERR $res->content;
+		#print STDERR "\nlat=[$lat], lon=[$lon]\n";
+	}
+}
+
+#-------------------------------------------------------------------
+# convert 4 or 6 character maidenhead grid to lat/lon
+# borrowed from scruss/VA3PID on 02011/04/01
+#-------------------------------------------------------------------
+sub maidenheadtolatlon {
+ 
+  # convert a Maidenhead Grid location (eg FN03ir)
+  #  to decimal degrees
+  # this code could be cleaner/shorter/clearer
+  my @locator =
+    split( //, uc(shift) );    # convert arg to upper case array
+  my $lat      = 0;
+  my $long    = 0;
+  my $latdiv   = 0;
+  my $longdiv  = 0;
+  my @divisors = ( 72000, 36000, 7200, 3600, 300, 150 )
+    ;                          # long,lat field size in seconds
+  my $max = ( $#locator > $#divisors ) ? $#divisors : $#locator;
+ 
+  for ( my $i = 0 ; $i <= $max ; $i++ ) {
+    if ( int( $i / 2 ) % 2 ) {    # numeric
+      if ( $i % 2 ) {             # lat
+        $latdiv = $divisors[$i];    # save for later
+        $lat += $locator[$i] * $latdiv;
+      }
+      else {                        # long
+        $longdiv = $divisors[$i];
+        $long += $locator[$i] * $longdiv;
+      }
+    }
+    else {                          # alpha
+      my $val = ord( $locator[$i] ) - ord('A');
+      if ( $i % 2 ) {               # lat
+        $latdiv = $divisors[$i];    # save for later
+        $lat += $val * $latdiv;
+      }
+      else {                        # long
+        $longdiv = $divisors[$i];
+        $long += $val * $longdiv;
+      }
+    }
+  }
+  $lat  += ( $latdiv / 2 );         # location of centre of square
+  $long += ( $longdiv / 2 );
+  return ( ( $lat / 3600 ) - 90, ( $long / 3600 ) - 180 );
+}
+
+#-------------------------------------------------------------------
+# lookupcall -- given callsign, lookup callsign info at http://call.n0agi.com/?c=CALLSIGN&f=s
+# returns $lat,$lon based on zipcode returned by n0agi
+#-------------------------------------------------------------------
+sub lookupcall {
+	my $call=shift;
+
+	$lat=$lon=0;
+	$callinfo="$call is not a valid US call sign.";
+	# if the callsign is a valid US call, then ask n0agi who it is
+	# begins with NKAW
+	# followed by 0 or 1 letter
+	# followed by 1 digit
+	# followed by 1, 2 or 3 letters
+	if($call =~ /([nkaw][a-z]{0,1}[0-9][a-z]{1,3})/i) {
+		$call=$1;	# get only the call, ignore any SSID
+		print STDERR "looking up US callsign $call at n0agi\n";
+
+		my $url="http://call.n0agi.com/?c=$call&f=s";
+		my $req = HTTP::Request->new(GET => $url);
+		$req->content_type('application/x-www-form-urlencoded');
+		$req->content('query=libwww-perl&mode=dist');
+		# Pass request to the user agent and get a response back
+		my $res = $ua->request($req);
+		# Check the outcome of the response
+		if ($res->is_success) {
+			#print STDERR "n0agi returned ",$res->content,"\n";
+			# returns extra|Punyamurthula, Nagendra|19655 Erin Ave|Prior Lake|MN|55372|Active
+			my ($class,$name,$address,$city,$state,$zip,$active,$junk)=split(/\|/,$res->content);
+			#print STDERR "n0agi zip=[$zip]\n";
+			# if the zipcode is exactly 5 digits, then lookup lat/lon
+			if($zip =~ /[0-9]{5,5}/) {
+				$lat=$ziplat{$zip};
+				$lon=$ziplon{$zip};
+				$callinfo="$call,$class,$name,$address,$city,$state,$zip";
+			}
+		}
+		else {
+			print STDERR "failure getting info from call.n0agi.com\n";
+		}
+	}
+}
+
+#-------------------------------------------------------------------
+# loadzips -- load zip code lat/lon from file
+#  sourced from gonames.org
+#country code      : iso country code, 2 characters
+#postal code       : varchar(20)
+#place name        : varchar(180)
+#admin name1       : 1. order subdivision (state) varchar(100)
+#admin code1       : 1. order subdivision (state) varchar(20)
+#admin name2       : 2. order subdivision (county/province) varchar(100)
+#admin code2       : 2. order subdivision (county/province) varchar(20)
+#admin name3       : 3. order subdivision (community) varchar(100)
+#admin code3       : 3. order subdivision (community) varchar(20)
+#latitude          : estimated latitude (wgs84)
+#longitude         : estimated longitude (wgs84)
+#accuracy          : accuracy of lat/lng from 1=estimated to 6=centroid
+#-------------------------------------------------------------------
+sub loadzips {
+	print STDERR "reading zip database\n";
+	open my $io, "<", $zipcodefile or die "$zipcodefile: $!";
+	while (<$io>) {
+		chomp();
+		# strip spaces out of city names
+		s/[ ]//g;
+		my ($country,$zipcode,$cityname,$statename,$stateabbr,$county,$countycode,$adminname3,$admincode3,,$csvlat,$csvlon,$accuracy)=split(/\t/);
+		$cityname=uc($cityname);
+		if($cityname eq "NEWYORKCITY") { 
+			$cityname="NEWYORK"; 
+		}
+		#print STDERR "$cityname,$stateabbr,$zipcode,$csvlat,$csvlon\n";
+		$citylat{"$cityname,$stateabbr"}=$csvlat;
+		$citylon{"$cityname,$stateabbr"}=$csvlon;
+
+		$ziplat{$zipcode}=$csvlat;
+		$ziplon{$zipcode}=$csvlon;
+	}
+	close $io;
+}
+
+
+#-------------------------------------------------------------------
+# loadicao -- load ICAO lat/lon from file
+#   fills in $icaolat{$icao} and $icaolon{$icao}
+# sourced from http://www.aviationweather.gov/static/adds/metars/stations.txt
+#-------------------------------------------------------------------
+sub loadicao {
+	print STDERR "loading ICAO stations\n";
+	my $file="stations.txt";
+	open my $io, "<", $file or die "$file: $!";
+	while (<$io>) {
+		chomp;
+		# skip comments, state, and header lines and anything with trailing space
+		if(/^\!|C$| $/) {
+			next;
+		}
+		# skip non METAR stations
+		if(substr($_,62,1) ne "X") {
+			next;
+		}
+		#print "$_\n";
+		# extract station ID, latitude/longitude from the text file
+		my $icao=substr($_,20,4);
+		my $iata=substr($_,26,3);
+		my $latdeg=substr($_,39,2);
+		my $latmin=substr($_,42,2);
+		my $latns=substr($_,44,1);
+		my $londeg=substr($_,47,3);
+		my $lonmin=substr($_,51,2);
+		my $lonew=substr($_,53,1);
+
+		my $latitude=$latdeg+$latmin*(1/60);	# convert minutes to decimal degrees
+		if($latns eq 'S') {
+			$latitude = $latitude *-1;
+		}
+
+		my $longitude=$londeg+$lonmin*(1/60);
+		if($lonew eq "W") {
+			$longitude=$longitude * -1;
+		}
+		$icaolat{$icao}=$latitude;
+		$icaolon{$icao}=$longitude;
+		if($iata ne "   ") {
+			$icaoiata{$iata}=$icao;
+		}
+
+		#print "icao=$icao, lat=$latitude, lon=$longitude\n";
+	}
+	close $io;
+}
+
+#-------------------------------------------------------------------
+# getmetar -- given ICAO station id, get metar from www.aviationweather.gov
+#  returns $metar
+#-------------------------------------------------------------------
+sub getmetar {
+	my $station=uc(shift);
+	print STDERR "getting metar for $station\n";
+
+	my $url="http://www.aviationweather.gov/adds/metars/?station_ids=$station&std_trans=standard&chk_metars=on&hoursStr=most+recent+only&submitmet=Submit";
+
+	my $req = HTTP::Request->new(GET => $url);
+	$req->content_type('application/x-www-form-urlencoded');
+	$req->content('query=libwww-perl&mode=dist');
+	# Pass request to the user agent and get a response back
+	my $res = $ua->request($req);
+	# Check the outcome of the response
+	if ($res->is_success) {
+		#print STDERR "aviationweather.gov returned ",$res->content,"\n";
+
+		my $result=$res->content;
+		# strip out cr/lf.  sometimes the METAR is split into multiple lines
+		$result =~ s/\r|\n//g;
+		# multi line regular expression that grabs anyhing with the ICAO station ID followed by an html tag
+		if($result=~/($station.+?)\</) {
+			$metar=$1;	# grab whatever the regex matched
+		}
+		else {
+			$metar="No data available for ICAO station $station";
+		}
+		#print STDERR "metar = [$metar]\n";
+	}
+}
+
+
+#-------------------------------------------------------------------
+# getNearestIcao -- given $lat/$lon return the nearest ICAO station
+#-------------------------------------------------------------------
+sub getNearestIcao() {
+	my $nearesticao="";
+	my $nearest=12000;
+	my $icao;
+	my $lat1=$lat * 0.0174533;	# convert latitude in degrees to radians
+	my $lon1=$lon * 0.0174533;	# convert longitude to radians
+
+	# loop through all of the ICAO stations and calculate the distance from $lat/$lon
+	# remember the one that is closest.
+	foreach $icao(keys %icaolat) {
+		my $lon2=$icaolon{$icao}*0.0174533; 
+		my $lat2=$icaolat{$icao}*0.0174533;
+		# use equirectangular approximation of distance 
+		my $x = ($lon2 - $lon1) * cos(($lat1 + $lat2)/2);
+		my $y = ($lat2-$lat1);
+		my $d = sqrt($x*$x + $y*$y) * 3959;	# 3959 is radius of the earth in miles
+		# if this station is nearer than the previous nearest, hang onto it
+		if($d < $nearest) {
+			#print STDERR "nearest $icao $d\n";
+			$nearest = $d;
+			$nearesticao=$icao;
+		}
+	}
+	return($nearesticao);
+}
+
+#-------------------------------------------------------------------
+# loadcwop -- load cwop station lat/lon from file
+#  sourced from http://wxqa.com/APRSWXNETStation.txt
+#
+# note, we really should download this file at least once a week
+# fields delimited with |
+# 0 ProviderId  - Data provider station id
+# 1 AFOS(HB5)Id - The AFOS or Handbook 5 id (NWS ID)
+# 2 Name        - Text name of station
+# 3 Elevation   - Elevation of station
+# 4 Latitude    - Latitude of station
+# 5 Longitude   - Longitude of station
+# 6 localTZ     - local Timezone (e.g. GMT)
+# 7 LocationDesc- Location/address of Station (Text)
+# 8 StationType - Type of station (i.e. tower, surface, floating platform,etc.)
+# 9 NumInst     - The number of reporting instruments for the station
+# 10 NumLevels   - Number of Reporting Levels for the data (Level information
+#                  should be provided in the instrument table.)
+# 11 Maint/CalSch- Frequency of Maintenance/Calibration
+# 12 SiteDesc    - A text description of the site surroundings
+#-------------------------------------------------------------------
+sub loadcwop {
+	print STDERR "reading cwop database\n";
+	my $file="APRSWXNETStation.txt";
+	my $cwop,$lat,$lon,$cwopcount;
+
+	open my $io, "<", $file or die "$file: $!";
+	while (<$io>) {
+		chomp();
+		# ignore comments
+		unless(/^\#/) {
+			# split the fields 
+			my @field=split(/\|/);
+			$cwop=uc $field[0];
+			# Amateur Radio CWOP stations begin with the letter A.  Aprs.fi stores the data under the callsign, not the CWOP id
+			if($cwop =~ /^A/) {
+				# the amateur callsign is the first word in field 2
+				($cwopcall{$cwop},$junk)=split(/ /,$field[2]);
+				#print "Amateur $cwop=$cwopcall{$cwop}\n";
+			}
+			$lat=$field[4];
+			$lat=~s/ //g;	# drop spaces
+			$lon=$field[5];
+			$lon=~s/ //g;
+			#print "got cwop $cwop $lat/$lon\n";
+			$cwoplat{$cwop}=$lat;
+			$cwoplon{$cwop}=$lon;
+			$cwopcount++;
+		}
+	}
+	close $io;
+	print STDERR "Loaded $cwopcount CWOP stations.\n";
+}
+
+#-------------------------------------------------------------------
+# getNearestCwopFindu -- given $lat/$lon return nearest CWOP station
+# using findu.com wxnear.cgi
+# returns CWOP station, and formatted $cwop
+#-------------------------------------------------------------------
+sub getNearestCwopFindu() {
+	print STDERR "getting closest CWOP for $lat/$lon from findu\n";
+
+	my $url="http://www.findu.com/cgi-bin/wxnear.cgi?lat=$lat\&lon=$lon\&noold=1\&limit=1";
+
+	#print STDERR "url=[$url]\n";
+
+	my $req = HTTP::Request->new(GET => $url);
+	$req->content_type('application/x-www-form-urlencoded');
+	$req->content('query=libwww-perl&mode=dist');
+	# Pass request to the user agent and get a response back
+	my $res = $ua->request($req);
+	# Check the outcome of the response
+	if ($res->is_success) {
+		#print STDERR "findu returned ",$res->content,"\n";
+
+		my $result=$res->content;
+		# findu returns an html table with results.
+		#$result =~ s/\r|\n//g;	# strip out cr/lf.
+		#print "result=[$result]\n";
+		# regular expression that wades through the html grabs the station ID.
+		if($result=~/<td> <a href=\"wxpage.cgi\?call=(.+?)\">/) {
+			$cwopstation=$1;
+			#print STDERR "nearest CWOP station $cwopstation\n";
+			return( getCwopFindu($cwopstation));
+		}
+		else {
+			print STDERR "no findu regex match: result=\n$result\n";
+		}
+	}
+	print STDERR "findu didn't return anything\n";
+	$cwop="";
+	return("");
+}
+
+#-------------------------------------------------------------------
+# getCwopFindu -- given $station return CWOP weather report
+#  uses http://www.findu.com/cgi-bin/wx.cgi?call=$station&last=1
+#  returns formatted $cwop report
+#-------------------------------------------------------------------
+sub getCwopFindu() {
+	my $station=$_[0];
+	print STDERR "looking at findu for possible CWOP station $station\n";
+	# get the last 1 hour of weather reports for station
+	my $url="http://www.findu.com/cgi-bin/wx.cgi?call=$station&last=1";
+	#print STDERR "url=[$url]\n";
+
+	my $req = HTTP::Request->new(GET => $url);
+	$req->content_type('application/x-www-form-urlencoded');
+	$req->content('query=libwww-perl&mode=dist');
+	# Pass request to the user agent and get a response back
+	my $res = $ua->request($req);
+	# Check the outcome of the response
+	if ($res->is_success) {
+		#print STDERR "findu returned ",$res->content,"\n";
+
+		my $result=$res->content;
+		# findu returns an html table with results.
+		$result =~ s/\r|\n//g;	# strip out cr/lf.
+		if($result=~/Sorry/) {	# no weather reports in the last hour
+			$cwop="No weather reports found for $station in the last hour";	
+			return(0);
+		}
+		#print "result=[$result]\n";
+
+		# regular expression that wades through the html grabs the weather results
+		if($result=~/<tr><td  align="center">(\d+) <\/td><td  align="center"> (\d+) <\/td><td  align="center"> (\d+) <\/td><td  align="center"> ([\d\.]+) <\/td><td  align="center"> ([\d\.]+)<\/td><td  align="center"> ([\d\.]+)<\/td><td  align="center"> ([\d\.]+)<\/td><td  align="center"> ([\d\.]+)<\/td><td  align="center"> (\d+)<\/td><td  align="center"> ([\d\.]+)<\/td>/) {
+
+			# $1=time
+			# $2=temp
+			# $3=wind direction
+			# $4=wind speed
+			# $5=wind gust
+			# $6=rain 1h
+			# $7=rain 24h
+			# $8=rain midnight
+			# $9=humidity
+			# $10=barometer
+			$cwoptime=$1;
+			$cwoptemp=$2;
+			$cwoppressure=$10;
+			$cwophumidity=$9;
+			$cwopwinddir=$3;
+			$cwopwindspeed=$4;
+			$cwopwindgust=$5;
+			$cwoprain1h=$6;
+			$cwoprain24h=$7;
+			$cwoprainmn=$8;
+			$cwopstation=$station;
+			formatcwop();	# take all of the above variables and format for APRS output
+			#print STDERR "findu returned station $1\n";
+			return($station);
+		}
+	}
+	print STDERR "findu didn't return anything\n";
+	$cwop="No CWOP data available for station $station";
+	return(0);
+}
+
+#-------------------------------------------------------------------
+# getNearestCwop -- given $lat/$lon return the nearest CWOP station
+# uses linear search to find the nearest station
+# unfortunately, many stations are in the list are inactive with no
+# recent results.. use getNearestCwopFindu instead
+#-------------------------------------------------------------------
+sub getNearestCwop() {
+	my $nearestcwop="";
+	my $nearest=12000;
+	my $cwop;
+	my $lat1=$lat * 0.0174533;	# convert latitude in degrees to radians
+	my $lon1=$lon * 0.0174533;	# convert longitude to radians
+	my @stationlist;		# list of nearest station
+
+	# loop through all of the cwop stations and calculate the distance from $lat/$lon
+	# remember the one that is closest.
+	foreach $cwop(keys %cwoplat) {
+		my $lon2=$cwoplon{$cwop}*0.0174533; 
+		my $lat2=$cwoplat{$cwop}*0.0174533;
+		# use equirectangular approximation of distance 
+		my $x = ($lon2 - $lon1) * cos(($lat1 + $lat2)/2);
+		my $y = ($lat2-$lat1);
+		my $d = sqrt($x*$x + $y*$y) * 3959;	# 3959 is radius of the earth in miles
+		# if this station is nearer than the previous nearest, hang onto it
+		if($d < $nearest) {
+			#print STDERR "nearest $cwop $d\n";
+			$nearest = $d;
+			$nearestcwop=$cwop;
+		}
+	}
+	return($nearestcwop);
+}
+
+#-------------------------------------------------------------------
+# getApiCwop given CWOP station, use api.aprs.fi to get the current weather
+# use api.aprs.fi 
+# not used as of version 1.13 
+#-------------------------------------------------------------------
+sub getApiCwop() {
+	my $call=$_[0];
+	my $station;
+
+	print STDERR "looking for CWOP data using api.aprs.fi $call\n";
+	# If the CWOP station is an amateur radio, then look up data using callsign instead of CWOP id
+	if( exists $cwopcall{$call}) {
+		#print STDERR "amateur station $cwopcall{$call}\n";
+		$station=$cwopcall{$call};
+	}
+	else {
+		$station=$call;
+	}
+	# Create a request
+	my $req = HTTP::Request->new(GET => "http://api.aprs.fi/api/get?name=$station&what=wx&apikey=$apikey&format=json");
+	$req->content_type('application/x-www-form-urlencoded');
+	$req->content('query=libwww-perl&mode=dist');
+
+	# Pass request to the user agent and get a response back
+	my $res = $ua->request($req);
+
+	# Check the outcome of the response
+	if ($res->is_success) {
+		# decode the json data
+		my $json=decode_json($res->content);
+
+		#print Dumper $json;
+
+		# if more than one result is found, we only look at the first one.
+		if($json->{found} >= 1) {
+			$cwoptime=$json->{entries}[0]{time};
+			$cwoptemp=$json->{entries}[0]{temp};
+			$cwoppressure=$json->{entries}[0]{pressure};
+			$cwophumidity=$json->{entries}[0]{humidity};
+			$cwopwinddir=$json->{entries}[0]{wind_direction};
+			$cwopwindspeed=$json->{entries}[0]{wind_speed};
+			$cwopwindgust=$json->{entries}[0]{wind_gust};
+			$cwoprain1h=$json->{entries}[0]{rain_1h};
+			$cwoprain24h=$json->{entries}[0]{rain_24h};
+			$cwoprainmn=$json->{entries}[0]{rain_mn};
+			$cwopstation=$call;
+
+			# make the temperature F 
+			$cwoptemp= sprintf("%.1fF",$cwoptemp*9/5+32);
+			if($cwopwindspeed == 0) {
+				$cwopwind="calm";
+			}
+			else {
+				$cwopwindspeed=sprintf("%d",$cwopwindspeed*2.24);	# convert m/s to mph
+				$cwopwindgust=sprintf("%d",$cwopwindgust*2.24);
+				$cwopwind = "$cwopwinddir\@$cwopwindspeed G$cwopwindgust";
+			}
+			# make the timestamp readable
+			my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime($cwoptime);
+			$year+=1900;	# stupid perl year is based at 1900
+			$mon++;		# months start at 0
+			$cwoptime=sprintf("%04d%02d%02d $02d:%02d",$year,$mon,$mday,$hour,$min);
+
+			formatcwop();	# take cwop weather and format into aprs message
+
+		}
+		else {
+			print STDERR "didn't get any weather data for $call on api.aprs.fi\n";
+			$cwoptime=0;
+			$cwopstation="";
+			$cwop="No CWOP data available for station $call";
+		}
+		#print STDERR $res->content;
+	}
+}
+
+#-------------------------------------------------------------------
+# formatcwop -- given cwop weather variables, return $cwop fomatted for APRS
+#-------------------------------------------------------------------
+sub formatcwop() {
+	my $rain;
+
+	if(($cwoprain1h+0) ==0 && ($cwoprain24h+0)==0) {
+		$rain="none";
+	}
+	else {
+		# convert rain from mm into inches
+		$cwoprain1h=sprintf("%.2fIn.",$cwoprain1h);	# if in mm, multiply by .03937
+		$cwoprain24h=sprintf("%.2fIn.",$cwoprain24h);
+		$rain = "1h\:$cwoprain1h,24h\:$cwoprain24h";
+	}
+	if($cwopwindspeed+0 == 0) {
+		$cwopwind="calm";
+	}
+	else {
+		$cwopwindspeed=sprintf("%d",$cwopwindspeed*2.24);	# convert m/s to mph
+		$cwopwindgust=sprintf("%d",$cwopwindgust*2.24);
+		$cwopwind = "$cwopwinddir\@$cwopwindspeed G$cwopwindgust";
+	}
+	
+	# format the results into something more or less readable
+	$cwop="$cwopstation $cwoptemp\F,Wind:$cwopwind,$cwoppressure\mbar,RH:$cwophumidity\%,Rain:$rain";
+}
+
+
+#-------------------------------------------------------------------
+# loadserved -- load the "forecastcount" number of served forecasts
+#-------------------------------------------------------------------
+sub loadserved() {
+	unless(open(my $fh, '<', $servedfilename)) {
+		print STDERR "unable to open $servedfilename.  Assuming zero forecastcount\n";
+		$forecastcount=0;
+	}
+	else {
+		while (my $row = <$fh>) {
+			chomp $row;
+			$forecastcount=int($row);
+			print STDERR "loaded forecast count = $forecastcount\n";
+		}
+		close($fh);
+	}
+}
+
+#-------------------------------------------------------------------
+# updateserved -- update the number of served forecasts 
+#-------------------------------------------------------------------
+sub updateserved() {
+	open(my $fh, '>', $servedfilename) or die "Could not open file '$servedfilename' $!";
+	print $fh "$forecastcount\n";
+	close $fh;
+}
